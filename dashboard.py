@@ -110,14 +110,40 @@ def get_dashboard_data(db_path=DB_PATH):
             "cache_creation": r["total_cache_creation"] or 0,
         })
 
+    # ── Per-request output tokens (for session tree) ─────────────────────────
+    request_rows = conn.execute("""
+        SELECT
+            session_id,
+            substr(timestamp, 1, 10)          as day,
+            substr(timestamp, 1, 16)          as ts,
+            COALESCE(model, 'unknown')        as model,
+            output_tokens,
+            input_tokens,
+            COALESCE(entry_type, 'text')      as entry_type
+        FROM turns
+        WHERE output_tokens > 0
+        ORDER BY session_id, timestamp DESC
+    """).fetchall()
+
+    output_per_request = [{
+        "session_id": r["session_id"],
+        "day":        r["day"],
+        "ts":         (r["ts"] or "").replace("T", " "),
+        "model":      r["model"],
+        "output":     r["output_tokens"],
+        "input":      r["input_tokens"] or 0,
+        "entry_type": r["entry_type"],
+    } for r in request_rows]
+
     conn.close()
 
     return {
-        "all_models":      all_models,
-        "daily_by_model":  daily_by_model,
-        "hourly_by_model": hourly_by_model,
-        "sessions_all":    sessions_all,
-        "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "all_models":         all_models,
+        "daily_by_model":     daily_by_model,
+        "hourly_by_model":    hourly_by_model,
+        "sessions_all":       sessions_all,
+        "output_per_request": output_per_request,
+        "generated_at":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -209,6 +235,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .export-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 3px 10px; border-radius: 5px; cursor: pointer; font-size: 11px; }
   .export-btn:hover { color: var(--text); border-color: var(--accent); }
   .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow-x: auto; }
+  .entry-type-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; margin-right: 3px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .et-thinking    { background: rgba(167,139,250,0.15); color: #a78bfa; }
+  .et-text        { background: rgba(79,142,247,0.15);  color: #4f8ef7; }
+  .et-tool_use    { background: rgba(251,146,60,0.15);  color: #fb923c; }
+  .et-tool_result { background: rgba(74,222,128,0.15);  color: #4ade80; }
+  .session-tree-row { cursor: pointer; }
+  .session-tree-row:hover td { background: rgba(255,255,255,0.04); }
+  .session-tree-row td:first-child { font-family: monospace; }
+  .toggle-icon { display: inline-block; width: 14px; transition: transform 0.15s; }
+  .toggle-icon.open { transform: rotate(90deg); }
+  .req-row td { font-size: 12px; color: var(--muted); border-bottom: 1px solid rgba(255,255,255,0.03); }
+  .req-row td:first-child { padding-left: 28px; font-family: monospace; color: var(--muted); }
+  .req-row.hidden { display: none; }
 
   footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 8px; }
   .footer-content { max-width: 1400px; margin: 0 auto; }
@@ -259,8 +298,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <span class="peak-legend" title="Mon–Fri 05:00–11:00 PT — Anthropic peak-hour throttling window"><span class="peak-swatch"></span>Peak hours (PT)</span>
           <span class="chart-day-count" id="hourly-day-count"></span>
           <div class="tz-group">
-            <button class="tz-btn" data-tz="local" onclick="setHourlyTZ('local')">Local</button>
-            <button class="tz-btn" data-tz="utc"   onclick="setHourlyTZ('utc')">UTC</button>
+            <button class="tz-btn hourly-tz-btn active" data-tz="local" onclick="setHourlyTZ('local')">Local</button>
+            <button class="tz-btn hourly-tz-btn" data-tz="utc"   onclick="setHourlyTZ('utc')">UTC</button>
           </div>
         </div>
       </div>
@@ -274,6 +313,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2>Top Projects by Tokens</h2>
       <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
     </div>
+  </div>
+  <div class="table-card">
+    <div class="section-header">
+      <div class="section-title">Output Tokens by Session / Request</div>
+      <div class="tz-group">
+        <button class="tz-btn req-tz-btn active" data-tz="local" onclick="setRequestTZ('local')">Local</button>
+        <button class="tz-btn req-tz-btn" data-tz="utc" onclick="setRequestTZ('utc')">UTC</button>
+      </div>
+    </div>
+    <table id="request-tree-table">
+      <thead><tr>
+        <th style="width:120px">Session</th>
+        <th>Project</th>
+        <th>Model</th>
+        <th class="num">Turns</th>
+        <th class="num">Output</th>
+        <th class="num">Input</th>
+        <th>Type</th>
+      </tr></thead>
+      <tbody id="request-tree-body"></tbody>
+    </table>
   </div>
   <div class="table-card">
     <div class="section-title">Cost by Model</div>
@@ -372,10 +432,12 @@ let projectSortDir = 'desc';
 let branchSortCol = 'cost';
 let branchSortDir = 'desc';
 let lastFilteredSessions = [];
+let lastFilteredRequests = [];
 let lastByProject = [];
 let lastByProjectBranch = [];
 let sessionSortDir = 'desc';
-let hourlyTZ = 'local';  // 'local' or 'utc'
+let hourlyTZ = 'local';   // 'local' or 'utc'
+let requestTZ = 'local';  // 'local' or 'utc'
 
 // ── Peak-hour config ───────────────────────────────────────────────────────
 // Anthropic throttles Mon–Fri 05:00–11:00 PT. We approximate as fixed UTC hours
@@ -538,10 +600,26 @@ function setRange(range) {
 
 function setHourlyTZ(mode) {
   hourlyTZ = mode;
-  document.querySelectorAll('.tz-btn').forEach(btn =>
+  document.querySelectorAll('.hourly-tz-btn').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.tz === mode)
   );
   applyFilter();
+}
+
+function setRequestTZ(mode) {
+  requestTZ = mode;
+  document.querySelectorAll('.req-tz-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.tz === mode)
+  );
+  renderRequestTree(lastFilteredSessions, lastFilteredRequests);
+}
+
+function utcTsToLocal(ts) {
+  try {
+    const d = new Date(ts.replace(' ', 'T') + ':00Z');
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch(e) { return ts; }
 }
 
 // ── Model filter ───────────────────────────────────────────────────────────
@@ -742,7 +820,7 @@ function applyFilter() {
 
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
@@ -750,12 +828,18 @@ function applyFilter() {
   document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
   document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
 
+  const filteredRequests = (rawData.output_per_request || []).filter(r =>
+    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
+  );
+
   renderStats(totals);
   renderDailyChart(daily);
   renderHourlyChart(hourlyAgg);
   renderModelChart(byModel);
   renderProjectChart(byProject);
   lastFilteredSessions = sortSessions(filteredSessions);
+  lastFilteredRequests = filteredRequests;
+  renderRequestTree(lastFilteredSessions, lastFilteredRequests);
   lastByProject = sortProjects(byProject);
   lastByProjectBranch = sortProjectBranch(byProjectBranch);
   renderSessionsTable(lastFilteredSessions.slice(0, 20));
@@ -772,6 +856,7 @@ function renderStats(t) {
     { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
     { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
     { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
+    { label: 'Avg Output / Req', value: t.turns ? fmt(Math.round(t.output / t.turns)) : '—', sub: 'tokens per request' },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
     { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
@@ -952,6 +1037,59 @@ function renderProjectChart(byProject) {
       }
     }
   });
+}
+
+function entryTypeBadges(entryType) {
+  if (!entryType) return '';
+  return entryType.split(',').map(t => {
+    const s = t.trim();
+    return `<span class="entry-type-badge et-${esc(s)}">${esc(s)}</span>`;
+  }).join('');
+}
+
+function renderRequestTree(sessions, requests) {
+  const reqBySession = {};
+  for (const r of requests) {
+    if (!reqBySession[r.session_id]) reqBySession[r.session_id] = [];
+    reqBySession[r.session_id].push(r);
+  }
+
+  const rows = [];
+  for (const s of sessions) {
+    const fullSid = Object.keys(reqBySession).find(k => k.startsWith(s.session_id)) || s.session_id;
+    const reqs = reqBySession[fullSid] || [];
+    const sid8 = s.session_id;
+    rows.push(`<tr class="session-tree-row" onclick="toggleSessionReqs('${esc(sid8)}')">
+      <td><span class="toggle-icon" id="ti-${esc(sid8)}">&#9658;</span> ${esc(sid8)}&hellip;</td>
+      <td>${esc(s.project)}</td>
+      <td><span class="model-tag">${esc(s.model)}</span></td>
+      <td class="num">${s.turns}</td>
+      <td class="num">${fmt(s.output)}</td>
+      <td class="num">${fmt(s.input)}</td>
+      <td></td>
+    </tr>`);
+    reqs.forEach((r, i) => {
+      const tsDisplay = requestTZ === 'local' ? utcTsToLocal(r.ts) : r.ts + ' UTC';
+      rows.push(`<tr class="req-row hidden" data-sid="${esc(sid8)}">
+        <td>#${i + 1}</td>
+        <td class="muted">${esc(tsDisplay)}</td>
+        <td></td>
+        <td></td>
+        <td class="num">${fmt(r.output)}</td>
+        <td class="num">${fmt(r.input)}</td>
+        <td>${entryTypeBadges(r.entry_type)}</td>
+      </tr>`);
+    });
+  }
+  document.getElementById('request-tree-body').innerHTML = rows.join('');
+}
+
+function toggleSessionReqs(sid8) {
+  const rows = document.querySelectorAll(`tr[data-sid="${sid8}"]`);
+  const icon = document.getElementById('ti-' + sid8);
+  const isOpen = icon.classList.contains('open');
+  rows.forEach(r => r.classList.toggle('hidden', isOpen));
+  icon.classList.toggle('open', !isOpen);
 }
 
 function renderSessionsTable(sessions) {
@@ -1203,9 +1341,12 @@ async function loadData() {
       document.querySelectorAll('.range-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
-      // Mark default TZ button active
-      document.querySelectorAll('.tz-btn').forEach(btn =>
+      // Mark default TZ buttons active
+      document.querySelectorAll('.hourly-tz-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
+      );
+      document.querySelectorAll('.req-tz-btn').forEach(btn =>
+        btn.classList.toggle('active', btn.dataset.tz === requestTZ)
       );
       // Build model filter (reads URL for model selection too)
       buildFilterUI(d.all_models);

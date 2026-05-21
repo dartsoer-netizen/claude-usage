@@ -64,6 +64,7 @@ def init_db(conn):
             cache_read_tokens       INTEGER DEFAULT 0,
             cache_creation_tokens   INTEGER DEFAULT 0,
             tool_name               TEXT,
+            entry_type              TEXT,
             cwd                     TEXT,
             message_id              TEXT
         );
@@ -83,6 +84,11 @@ def init_db(conn):
         conn.execute("SELECT message_id FROM turns LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE turns ADD COLUMN message_id TEXT")
+    # Add entry_type column if upgrading from older schema
+    try:
+        conn.execute("SELECT entry_type FROM turns LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE turns ADD COLUMN entry_type TEXT")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -171,12 +177,17 @@ def parse_jsonl_file(filepath):
                     if input_tokens + output_tokens + cache_read + cache_creation == 0:
                         continue
 
-                    # Extract tool name from content if present
+                    # Extract tool name and all content block types
                     tool_name = None
+                    entry_types = []
                     for item in msg.get("content", []):
-                        if isinstance(item, dict) and item.get("type") == "tool_use":
-                            tool_name = item.get("name")
-                            break
+                        if isinstance(item, dict):
+                            btype = item.get("type")
+                            if btype and btype not in entry_types:
+                                entry_types.append(btype)
+                            if btype == "tool_use" and tool_name is None:
+                                tool_name = item.get("name")
+                    entry_type = ",".join(entry_types) if entry_types else "text"
 
                     if model:
                         session_meta[session_id]["model"] = model
@@ -190,12 +201,23 @@ def parse_jsonl_file(filepath):
                         "cache_read_tokens": cache_read,
                         "cache_creation_tokens": cache_creation,
                         "tool_name": tool_name,
+                        "entry_type": entry_type,
                         "cwd": cwd,
                         "message_id": message_id,
                     }
 
-                    # Dedup: last record per message_id wins (final usage tallies)
+                    # Dedup: last record per message_id wins (final usage tallies).
+                    # entry_type is accumulated across streaming records — each record
+                    # may carry only one content block type (e.g. thinking, then text).
                     if message_id:
+                        if message_id in seen_messages:
+                            prev = seen_messages[message_id].get("entry_type", "")
+                            combined = prev
+                            for t in entry_type.split(","):
+                                t = t.strip()
+                                if t and t not in combined.split(","):
+                                    combined = (combined + "," + t).strip(",")
+                            turn["entry_type"] = combined
                         seen_messages[message_id] = turn
                     else:
                         turns_no_id.append(turn)
@@ -303,13 +325,13 @@ def insert_turns(conn, turns):
     conn.executemany("""
         INSERT OR IGNORE INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cache_read_tokens, cache_creation_tokens, tool_name, entry_type, cwd, message_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"], t.get("message_id", ""))
+         t["tool_name"], t.get("entry_type", "text"), t["cwd"], t.get("message_id", ""))
         for t in turns
     ])
 
@@ -435,10 +457,15 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                                 continue
 
                             tool_name = None
+                            entry_types = []
                             for item in msg.get("content", []):
-                                if isinstance(item, dict) and item.get("type") == "tool_use":
-                                    tool_name = item.get("name")
-                                    break
+                                if isinstance(item, dict):
+                                    btype = item.get("type")
+                                    if btype and btype not in entry_types:
+                                        entry_types.append(btype)
+                                    if btype == "tool_use" and tool_name is None:
+                                        tool_name = item.get("name")
+                            entry_type = ",".join(entry_types) if entry_types else "text"
 
                             if model:
                                 new_session_metas[session_id]["model"] = model
@@ -452,11 +479,20 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                                 "cache_read_tokens": cache_read,
                                 "cache_creation_tokens": cache_creation,
                                 "tool_name": tool_name,
+                                "entry_type": entry_type,
                                 "cwd": cwd,
                                 "message_id": message_id,
                             }
 
                             if message_id:
+                                if message_id in seen_messages:
+                                    prev = seen_messages[message_id].get("entry_type", "")
+                                    combined = prev
+                                    for t in entry_type.split(","):
+                                        t = t.strip()
+                                        if t and t not in combined.split(","):
+                                            combined = (combined + "," + t).strip(",")
+                                    turn["entry_type"] = combined
                                 seen_messages[message_id] = turn
                             else:
                                 turns_no_id.append(turn)
